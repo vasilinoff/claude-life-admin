@@ -4,7 +4,7 @@ A personal assistant for life admin built from [Claude Code](https://claude.com/
 a folder of Markdown and two hooks. It turns letters into dated tasks, keeps a file for every
 ongoing matter and pings you only when something happened.
 
-Write-up: _link to the blog post_
+Write-up: [Claude Code as a Life-Admin Assistant](https://vasilinoff.dev/blog/claude-runs-my-life-admin/)
 
 ```
 You / Gmail / launchd ──► Claude Code + assistant skill ──► pa ──► Google Calendar & Tasks
