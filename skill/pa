@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""pa — personal assistant CLI over Google Calendar + Google Tasks (stdlib only).
+
+  pa agenda [days]                       events + tasks (default 7 days)
+  pa event "Title" "2026-08-20 15:00" [minutes] [notes] [calendar]
+  pa cancel "part of title"              cancel an event (searches ±60 days)
+  pa task  "Title" [2026-08-20] [notes]
+  pa done  "part of title"
+  pa recent [days]                       what happened / got done in N days (default 7)
+  pa auth                                one-time Google sign-in
+
+Dates: YYYY-MM-DD or "YYYY-MM-DD HH:MM" (no time = 09:00).
+"""
+import http.server
+import json
+import os
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+CFG = os.path.join(HOME, ".pa")
+TOKEN_PATH = os.path.join(CFG, "token.json")
+CLIENT_PATHS = [os.path.join(CFG, "client.json"),
+                os.path.join(HOME, ".gmail-mcp", "gcp-oauth.keys.json")]
+SCOPES = "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/tasks"
+TZ = os.path.realpath("/etc/localtime").split("zoneinfo/")[-1]
+# ponytail: skip noisy read-only calendars; extend the list if new ones show up
+SKIP_CAL_SUFFIXES = ("holiday@group.v.calendar.google.com", "#weeknum@group.v.calendar.google.com")
+
+
+# ---------- auth ----------
+
+def client_config():
+    for p in CLIENT_PATHS:
+        if os.path.exists(p):
+            data = json.load(open(p))
+            conf = data.get("installed") or data.get("web")
+            if not conf:
+                continue
+            if "installed" not in data:
+                print(f"warning: {p} is a 'web' OAuth client; loopback needs a "
+                      f"'Desktop app' client. Create one and put it at {CFG}/client.json",
+                      file=sys.stderr)
+            return conf
+    sys.exit(f"no OAuth client: put a Desktop client at {CFG}/client.json")
+
+
+def save_token(tok):
+    os.makedirs(CFG, exist_ok=True)
+    with open(TOKEN_PATH, "w") as f:
+        json.dump(tok, f)
+    os.chmod(TOKEN_PATH, 0o600)
+
+
+def post_form(url, data):
+    req = urllib.request.Request(url, urllib.parse.urlencode(data).encode())
+    return json.load(urllib.request.urlopen(req))
+
+
+def auth():
+    conf = client_config()
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    redirect = f"http://localhost:{port}"
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": conf["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": SCOPES, "access_type": "offline", "prompt": "consent"})
+    box = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            box.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<h2>Done, you can close this tab.</h2>".encode())
+
+        def log_message(self, *a):
+            pass
+
+    print("Opening the browser for Google sign-in…\nIf it did not open:", url)
+    webbrowser.open(url)
+    http.server.HTTPServer(("127.0.0.1", port), Handler).handle_request()
+    if "code" not in box:
+        sys.exit("sign-in failed: " + box.get("error", "no code"))
+    tok = post_form("https://oauth2.googleapis.com/token", {
+        "code": box["code"], "client_id": conf["client_id"],
+        "client_secret": conf["client_secret"], "redirect_uri": redirect,
+        "grant_type": "authorization_code"})
+    tok["client_id"] = conf["client_id"]
+    tok["client_secret"] = conf["client_secret"]
+    save_token(tok)
+    return "OK: Google Calendar and Tasks access saved to " + TOKEN_PATH
+
+
+def access_token():
+    if not os.path.exists(TOKEN_PATH):
+        sys.exit("no token, run: pa auth")
+    tok = json.load(open(TOKEN_PATH))
+    try:
+        fresh = post_form("https://oauth2.googleapis.com/token", {
+            "refresh_token": tok["refresh_token"], "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"], "grant_type": "refresh_token"})
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Google token revoked or expired ({e.read().decode()[:200]}), run: pa auth")
+    return fresh["access_token"]
+
+
+_TOKEN_CACHE = []
+
+
+def api(path, params=None, method="GET", body=None):
+    if not _TOKEN_CACHE:
+        _TOKEN_CACHE.append(access_token())
+    url = "https://www.googleapis.com" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Authorization": "Bearer " + _TOKEN_CACHE[0],
+                                          "Content-Type": "application/json"})
+    try:
+        raw = urllib.request.urlopen(req).read()
+        return json.loads(raw) if raw.strip() else {}  # DELETE returns 204 with no body
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:600]
+        sys.exit(f"Google API {e.code} on {path}:\n{detail}")
+
+
+# ---------- helpers ----------
+
+def parse_when(s, default_hour=9):
+    s = s.strip()
+    for fmt, has_time in (("%Y-%m-%d %H:%M", True), ("%Y-%m-%dT%H:%M", True), ("%Y-%m-%d", False)):
+        try:
+            d = datetime.strptime(s, fmt)
+            return d if has_time else d.replace(hour=default_hour)
+        except ValueError:
+            continue
+    sys.exit(f'cannot parse date "{s}", expected YYYY-MM-DD or "YYYY-MM-DD HH:MM"')
+
+
+def rfc3339(dt):
+    return dt.astimezone().isoformat()
+
+
+def ev_start(e):
+    s = e["start"]
+    return s.get("dateTime") or s.get("date")
+
+
+def pretty(iso):
+    if len(iso) == 10:
+        return iso + " all day"
+    d = datetime.fromisoformat(iso).astimezone()
+    return d.strftime("%Y-%m-%d %H:%M")
+
+
+def calendars():
+    out = []
+    for c in api("/calendar/v3/users/me/calendarList").get("items", []):
+        if c.get("selected") is False or c["id"].endswith(SKIP_CAL_SUFFIXES):
+            continue
+        out.append((c["id"], c.get("summaryOverride") or c["summary"]))
+    return out
+
+
+def open_tasks():
+    out = []
+    for tl in api("/tasks/v1/users/@me/lists").get("items", []):
+        for t in api(f"/tasks/v1/lists/{tl['id']}/tasks",
+                     {"showCompleted": "false", "maxResults": 100}).get("items", []):
+            out.append({"id": t["id"], "list": tl["id"], "list_name": tl["title"],
+                        "title": t.get("title", ""), "due": t.get("due"), "notes": t.get("notes")})
+    out.sort(key=lambda t: t["due"] or "9999")
+    return out
+
+
+# ---------- commands ----------
+
+def agenda(days=7):
+    now = datetime.now().astimezone()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=days)
+    lines = [f"# Events {start:%Y-%m-%d} → {end:%Y-%m-%d}"]
+    events = []
+    for cid, name in calendars():
+        for e in api(f"/calendar/v3/calendars/{urllib.parse.quote(cid)}/events",
+                     {"timeMin": rfc3339(start), "timeMax": rfc3339(end), "singleEvents": "true",
+                      "orderBy": "startTime", "maxResults": 100}).get("items", []):
+            if e.get("status") == "cancelled":
+                continue
+            events.append((ev_start(e), e.get("summary", "(untitled)"), name))
+    events.sort(key=lambda x: x[0])
+    lines += [f"- {pretty(s)}  {t}  [{c}]" for s, t, c in events] or ["(empty)"]
+
+    lines.append("")
+    lines.append("# Tasks")
+    today = now.strftime("%Y-%m-%d")
+    tasks = open_tasks()
+    for t in tasks:
+        due = t["due"][:10] if t["due"] else "no due date"
+        mark = "  ⚠ OVERDUE" if t["due"] and t["due"][:10] < today else ""
+        if t["due"] and t["due"][:10] == today:
+            mark = "  ← today"
+        lines.append(f"- {due}  {t['title']}  [{t['list_name']}]{mark}")
+    if not tasks:
+        lines.append("(empty)")
+    return "\n".join(lines)
+
+
+def recent(days=7):
+    now = datetime.now().astimezone()
+    start = now - timedelta(days=days)
+    lines = [f"# Since {start:%Y-%m-%d}"]
+    events = []
+    for cid, name in calendars():
+        for e in api(f"/calendar/v3/calendars/{urllib.parse.quote(cid)}/events",
+                     {"timeMin": rfc3339(start), "timeMax": rfc3339(now), "singleEvents": "true",
+                      "orderBy": "startTime", "maxResults": 100}).get("items", []):
+            if e.get("status") == "cancelled":
+                continue
+            events.append((ev_start(e), e.get("summary", "(untitled)"), name))
+    events.sort(key=lambda x: x[0])
+    lines += [f"- {pretty(s)}  {t}  [{c}]" for s, t, c in events] or ["(empty)"]
+
+    lines += ["", "# Completed tasks"]
+    done = []
+    for tl in api("/tasks/v1/users/@me/lists").get("items", []):
+        for t in api(f"/tasks/v1/lists/{tl['id']}/tasks",
+                     {"showCompleted": "true", "showHidden": "true",
+                      "completedMin": rfc3339(start), "maxResults": 100}).get("items", []):
+            if t.get("status") == "completed":
+                done.append(f"- {t['completed'][:10]}  {t.get('title', '')}  [{tl['title']}]")
+    lines += sorted(done) or ["(empty)"]
+    return "\n".join(lines)
+
+
+def add_event(title, when, minutes=60, notes="", cal_hint=""):
+    start = parse_when(when)
+    end = start + timedelta(minutes=int(minutes or 60))
+    cid, cname = "primary", "primary"
+    if cal_hint:
+        match = [(i, n) for i, n in calendars() if cal_hint.lower() in n.lower()]
+        if not match:
+            sys.exit(f"calendar \"{cal_hint}\" not found: " + ", ".join(n for _, n in calendars()))
+        cid, cname = match[0]
+    body = {"summary": title, "description": notes or "",
+            "start": {"dateTime": rfc3339(start.astimezone()), "timeZone": TZ},
+            "end": {"dateTime": rfc3339(end.astimezone()), "timeZone": TZ}}
+    ev = api(f"/calendar/v3/calendars/{urllib.parse.quote(cid)}/events", method="POST", body=body)
+    return f"OK event: {title} — {start:%Y-%m-%d %H:%M}–{end:%H:%M} [{cname}]\n{ev.get('htmlLink', '')}"
+
+
+def cancel_event(needle, days=60):
+    now = datetime.now().astimezone()
+    hits = []
+    for cid, name in calendars():
+        for e in api(f"/calendar/v3/calendars/{urllib.parse.quote(cid)}/events",
+                     {"q": needle, "timeMin": rfc3339(now - timedelta(days=1)),
+                      "timeMax": rfc3339(now + timedelta(days=days)), "singleEvents": "true",
+                      "orderBy": "startTime"}).get("items", []):
+            if e.get("status") != "cancelled":
+                hits.append((cid, name, e))
+    if not hits:
+        sys.exit("event not found: " + needle)
+    if len(hits) > 1:
+        sys.exit("ambiguous, matches:\n" + "\n".join(
+            f"- {pretty(ev_start(e))} {e.get('summary', '')} [{n}]" for _, n, e in hits))
+    cid, name, e = hits[0]
+    api(f"/calendar/v3/calendars/{urllib.parse.quote(cid)}/events/{e['id']}", method="DELETE")
+    return f"OK cancelled: {e.get('summary', '')} — {pretty(ev_start(e))} [{name}]"
+
+
+def add_task(title, due="", notes=""):
+    body = {"title": title}
+    if notes:
+        body["notes"] = notes
+    if due:
+        d = parse_when(due)
+        body["due"] = d.strftime("%Y-%m-%dT00:00:00.000Z")  # the Tasks API stores the date only
+    api("/tasks/v1/lists/@default/tasks", method="POST", body=body)
+    return f"OK task: {title}" + (f", due {parse_when(due):%Y-%m-%d}" if due else "")
+
+
+def mark_done(needle):
+    hits = [t for t in open_tasks() if needle.lower() in t["title"].lower()]
+    if not hits:
+        sys.exit("task not found: " + needle)
+    if len(hits) > 1:
+        sys.exit("ambiguous, matches:\n" + "\n".join("- " + t["title"] for t in hits))
+    t = hits[0]
+    api(f"/tasks/v1/lists/{t['list']}/tasks/{t['id']}", method="PATCH", body={"status": "completed"})
+    return "OK done: " + t["title"]
+
+
+def main(argv):
+    cmd = argv[0] if argv else "help"
+    a = argv[1:]
+    if cmd == "auth":
+        return auth()
+    if cmd == "agenda":
+        return agenda(int(a[0]) if a else 7)
+    if cmd == "recent":
+        return recent(int(a[0]) if a else 7)
+    if cmd == "event":
+        return add_event(*a[:5])
+    if cmd == "cancel":
+        return cancel_event(a[0])
+    if cmd == "task":
+        return add_task(*a[:3])
+    if cmd == "done":
+        return mark_done(a[0])
+    return __doc__
+
+
+if __name__ == "__main__":
+    print(main(sys.argv[1:]))

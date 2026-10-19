@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/vault-reminder.sh", "timeout": 10 }] }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/vault-sync.py", "timeout": 10 }]
+      }
+    ]
+  }
+}

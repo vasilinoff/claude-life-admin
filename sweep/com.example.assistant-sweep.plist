@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Replace YOU with your username, copy to ~/Library/LaunchAgents/ and run:
+     launchctl load ~/Library/LaunchAgents/com.example.assistant-sweep.plist -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.assistant-sweep</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/YOU/bin/AssistantSweep.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>47</integer></dict>
+		<dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>47</integer></dict>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/tmp/assistant-sweep.out</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/assistant-sweep.err</string>
+</dict>
+</plist>
